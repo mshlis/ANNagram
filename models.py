@@ -1,8 +1,11 @@
-import tensorflow as tf
+import warnings
+with warnings.catch_warnings():  
+    warnings.filterwarnings("ignore",category=FutureWarning)
+    import tensorflow as tf
 
-keras = tf.keras
-K = keras.backend
-from tensorflow.keras.layers import *
+    keras = tf.keras
+    K = keras.backend
+    from tensorflow.keras.layers import Dense, Embedding, Add, LayerNormalization, Input, Lambda
 
 import numpy as np
 from functools import partial
@@ -137,22 +140,26 @@ def decode_block(x, enc_x, num_heads, dim, bias0, bias1, block_number):
     x = LayerNormalization()(x)
     return x
 
-def pointer(inputs):
+def pointer(pointer_querys, pointer_targets, bias=None):
     """
     using a pointer-net like head
     """
-    pointers, points = inputs
-    logits = K.batch_dot(pointers, points, axes=2)
-    probits = K.softmax(logits)
+    logits = K.batch_dot(pointer_querys, pointer_targets, axes=2)    
+    if bias is None:
+        probits = K.softmax(logits)
+    else:
+        probits = K.softmax(logits+bias)
     return probits
 
 def make_bias(key, query, meta):
     """
     generates bias based on mask meta
     """
+    # bias based on key == meta
     mask_key = tf.cast(tf.not_equal(key, meta), tf.float32)
     mask_key = tf.expand_dims(mask_key, -1)
     
+    # bias based on query == meta
     mask_query = tf.cast(tf.not_equal(query, meta), tf.float32)
     mask_query = tf.expand_dims(mask_query, -1)
     
@@ -166,39 +173,50 @@ def make_temporal_bias(key):
     """
     batch_size = tf.shape(key)[0]
     N = tf.shape(key)[1]
-    bias =  -1e9 * (1 - tf.matrix_band_part(tf.ones((N, N)), -1, 0))
+    bias =  -1e9 * (1 - tf.linalg.band_part(tf.ones((N, N)), -1, 0))
     bias = tf.tile(tf.expand_dims(bias, 0), (batch_size, 1, 1))
     return bias
     
 
 def pointer_transformer(alphabet_size=28,
-                        dim=64,
-                        num_heads=6,
                         blocks=4,
+                        num_heads=6,
+                        dim=64,
+                        dropout=.1,
                         mask_meta=2):
     """
     pointer-transformer network
     """
+    # encoder input/bias
     inpt_encoder = Input(shape=(None,), name='inpt_encoder')
     encoder_bias = Lambda(lambda u : make_bias(*u, meta=mask_meta))([inpt_encoder, inpt_encoder])
     
+    # decoder input/bias
     inpt_decoder = Input(shape=(None,), name='inpt_decoder')
     decoder_bias_0 = Lambda(lambda u : make_bias(*u, meta=mask_meta))([inpt_decoder, inpt_decoder])
     decoder_bias_1 = Lambda(lambda u : make_bias(*u, meta=mask_meta))([inpt_encoder, inpt_decoder])
-
     
-
+    # bias input for training
+    bias_inpt = Input(shape=(None, None))
+    
+    # embedding the letters
     embedding = Embedding(input_dim=alphabet_size, output_dim=dim, name='embedding')
     ex = embedding(inpt_encoder)
+    if dropout: ex = Dropout(dropout)(ex)
     dx = embedding(inpt_decoder)
+    if dropout: dx = Dropout(dropout)(dx)
 
+    # each iter is one enc/dec block
     for i in range(blocks):   
         ex = encode_block(ex, num_heads, dim, encoder_bias, i)
+        if dropout: ex = Dropout(dropout)(ex)
         dx = decode_block(dx, ex, num_heads, dim, decoder_bias_0, decoder_bias_1, i)
+        if dropout: dx = Dropout(dropout)(dx)
 
+    # use a pointer-net based model
     ex = Dense(dim, activation='relu')(ex)
-    outpt = Lambda(pointer, name='pointer')([dx, ex])
-    model = keras.Model([inpt_decoder, inpt_encoder], outpt)
+    outpt = Lambda(lambda u : pointer(*u), name='pointer')([dx, ex, bias_inpt])
+    model = keras.Model([inpt_decoder, inpt_encoder, bias_inpt], outpt)
     return model
     
     
